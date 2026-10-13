@@ -428,17 +428,8 @@ def create_fastwam_optional_idm(
 
 
 def build_datasets(data_cfg: DictConfig):
-    train_ds = instantiate(data_cfg.train)
-    if data_cfg.get("val") is None:
-        val_ds = train_ds
-    else:
-        train_stats_path = data_cfg.train.get("pretrained_norm_stats")
-        default_stats_path = os.path.join(misc.get_work_dir(), "dataset_stats.json")
-        val_stats_path = data_cfg.val.get("pretrained_norm_stats")
-        pretrained_norm_stats = val_stats_path or train_stats_path or default_stats_path
-        logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
-        val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
-    return train_ds, val_ds
+    """Build the iterable training dataset; evaluation runs as external simulator rollouts."""
+    return instantiate(data_cfg.train), None
 
 
 def _resolve_train_device() -> str:

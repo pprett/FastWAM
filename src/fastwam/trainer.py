@@ -14,12 +14,11 @@ from accelerate.data_loader import prepare_data_loader
 from omegaconf import DictConfig
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
-from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
@@ -31,7 +30,6 @@ class Wan22Trainer:
         self.model = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
-        self._iterable_train = isinstance(train_dataset, IterableDataset)
         self.cfg = cfg
         self.output_dir = str(cfg.output_dir)
         self.learning_rate = float(cfg.learning_rate)
@@ -107,7 +105,7 @@ class Wan22Trainer:
         self.global_step = 0
         self.epoch = 0
         self.batch_in_epoch = 0
-        self._resume_iterable_batches = 0
+        self._resume_batches = 0
 
         self.checkpoint_root = os.path.join(self.output_dir, "checkpoints")
         self.weights_dir = os.path.join(self.checkpoint_root, "weights")
@@ -120,57 +118,28 @@ class Wan22Trainer:
         ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
 
-        if self._iterable_train and bool(getattr(self.model, "compile_training_denoise", False)):
-            raise ValueError("compile_training_denoise is not supported with iterable training datasets")
         if bool(getattr(self.model, "compile_training_denoise", False)):
-            logger.info("Compiling training denoise forward/backward before DeepSpeed initialization.")
-            compile_start = time.perf_counter()
-            warmup_loader = DataLoader(
-                self.train_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                sampler=self.train_sampler,
-                num_workers=0,
-            )
-            warmup_sample = next(iter(warmup_loader))
-            with self.accelerator.autocast():
-                warmup_loss, _ = self.model.training_loss(warmup_sample)
-            warmup_loss.backward()
-            self.optimizer.zero_grad(set_to_none=True)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(self.accelerator.device)
-            logger.info(
-                "Finished training denoise compile warmup in %.2f seconds.",
-                time.perf_counter() - compile_start,
-            )
-            set_global_seed(self.seed)
+            raise ValueError("compile_training_denoise is not supported with iterable training datasets")
 
-        if self._iterable_train:
-            # Rerun already partitions the stream across ranks and workers. Do not pass its loader
-            # to Accelerate, which would wrap it in IterableDatasetShard and shard it a second time.
-            deepspeed_plugin = self.accelerator.state.deepspeed_plugin
-            if deepspeed_plugin is not None:
-                deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = self.batch_size
-            self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
-                self.model, self.optimizer, self.scheduler
-            )
-            # Keep Accelerate's device placement and end-of-dataloader tracking, but use a
-            # one-process topology because Rerun has already sharded the stream by global rank.
-            self.train_loader = prepare_data_loader(
-                self.train_loader,
-                device=self.accelerator.device,
-                num_processes=1,
-                process_index=0,
-                put_on_device=self.accelerator.device_placement,
-                dispatch_batches=False,
-                even_batches=False,
-                rng_types=self.accelerator.rng_types.copy(),
-                non_blocking=True,
-            )
-        else:
-            self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
-                self.model, self.optimizer, self.train_loader, self.scheduler
-            )
+        # Rerun already partitions the stream across ranks and workers. Prepare it with a
+        # one-process topology so Accelerate only provides device placement and epoch tracking.
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        if deepspeed_plugin is not None:
+            deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = self.batch_size
+        self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
+            self.model, self.optimizer, self.scheduler
+        )
+        self.train_loader = prepare_data_loader(
+            self.train_loader,
+            device=self.accelerator.device,
+            num_processes=1,
+            process_index=0,
+            put_on_device=self.accelerator.device_placement,
+            dispatch_batches=False,
+            even_batches=False,
+            rng_types=self.accelerator.rng_types.copy(),
+            non_blocking=True,
+        )
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
         self._init_wandb()
@@ -216,28 +185,10 @@ class Wan22Trainer:
         self.wandb_run = None
 
     def _build_loader(self, dataset, worker_init_fn=None):
-        if isinstance(dataset, IterableDataset):
-            self.train_sampler = None
-            return DataLoader(
-                dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=self.num_workers,
-                pin_memory=torch.cuda.is_available(),
-                worker_init_fn=worker_init_fn,
-            )
-
-        self.train_sampler = ResumableEpochSampler(
-            dataset=dataset,
-            seed=self.seed,
-            batch_size=self.batch_size,
-            num_processes=self.accelerator.num_processes,
-        )
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            sampler=self.train_sampler,
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
@@ -673,12 +624,8 @@ class Wan22Trainer:
             if "epoch" in payload and "batch_in_epoch" in payload:
                 self.epoch = int(payload["epoch"])
                 self.batch_in_epoch = int(payload["batch_in_epoch"])
-                if self.train_sampler is not None:
-                    self.train_sampler.set_epoch_offset(self.epoch)
-                    self.train_sampler.set_resume_batch_offset(self.batch_in_epoch)
-                else:
-                    self.train_dataset.set_epoch(self.epoch)
-                    self._resume_iterable_batches = self.batch_in_epoch
+                self.train_dataset.set_epoch(self.epoch)
+                self._resume_batches = self.batch_in_epoch
                 logger.info(
                     "Restored dataloader progress: epoch=%d batch_in_epoch=%d sample_offset=%d",
                     self.epoch,
@@ -688,9 +635,7 @@ class Wan22Trainer:
             else:
                 self.epoch = 0
                 self.batch_in_epoch = 0
-                if self.train_sampler is not None:
-                    self.train_sampler.clear_resume_batch_offset()
-                self._resume_iterable_batches = 0
+                self._resume_batches = 0
                 logger.warning(
                     "State file does not contain `epoch`/`batch_in_epoch`; "
                     "optimizer/scheduler were restored, but dataloader progress resume is skipped."
@@ -705,9 +650,7 @@ class Wan22Trainer:
             self.global_step = 0
         self.epoch = 0
         self.batch_in_epoch = 0
-        if self.train_sampler is not None:
-            self.train_sampler.clear_resume_batch_offset()
-        self._resume_iterable_batches = 0
+        self._resume_batches = 0
         self.accelerator.wait_for_everyone()
         logger.info("Loaded accelerate training state from %s at step=%d", state_dir, self.global_step)
         logger.warning(
@@ -716,13 +659,11 @@ class Wan22Trainer:
         )
 
     def _new_train_iterator(self):
-        if self._iterable_train:
-            self.train_dataset.set_epoch(self.epoch)
-            if hasattr(self.train_loader, "set_epoch"):
-                self.train_loader.set_epoch(self.epoch)
+        self.train_dataset.set_epoch(self.epoch)
+        self.train_loader.set_epoch(self.epoch)
         data_iter = iter(self.train_loader)
-        if self._resume_iterable_batches:
-            batches_to_skip = self._resume_iterable_batches
+        if self._resume_batches:
+            batches_to_skip = self._resume_batches
             for _ in range(batches_to_skip):
                 try:
                     next(data_iter)
@@ -730,7 +671,7 @@ class Wan22Trainer:
                     raise RuntimeError(
                         f"Cannot resume at batch {batches_to_skip}: iterable epoch ended early"
                     ) from err
-            self._resume_iterable_batches = 0
+            self._resume_batches = 0
             logger.info("Skipped %d iterable batches to restore dataloader progress", batches_to_skip)
         return data_iter
 
@@ -754,8 +695,6 @@ class Wan22Trainer:
             except StopIteration:
                 self.epoch += 1
                 self.batch_in_epoch = 0
-                if self.train_sampler is not None:
-                    self.train_sampler.clear_resume_batch_offset()
                 data_iter = self._new_train_iterator()
                 continue
 
