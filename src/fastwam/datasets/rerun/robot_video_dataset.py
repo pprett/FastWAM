@@ -7,7 +7,6 @@ import multiprocessing
 import os
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, cast
 
 import numpy as np
@@ -23,9 +22,9 @@ from rerun.experimental.dataloader import (
     DecodeRequest,
     Field,
     FieldBatch,
+    NoShuffle,
     NumericDecoder,
     RerunIterableDataset,
-    RerunMapDataset,
     SampleIndex,
     VideoFrameDecoder,
 )
@@ -190,76 +189,111 @@ class _RankShardedRerunIterableDataset(RerunIterableDataset):
         return indices, block_bounds
 
 
-def _sliding_window(values: torch.Tensor, window_size: int) -> torch.Tensor:
-    positions = torch.arange(len(values)).unsqueeze(1) + torch.arange(window_size).unsqueeze(0)
-    return values[positions.clamp(max=len(values) - 1)]
-
-
 def compute_dataset_stats(data_config: DictConfig) -> dict[str, Any]:
-    """Compute action/state normalization statistics without constructing the video dataset."""
+    """Compute action/state normalization statistics from a numeric-only iterable stream."""
     shape_meta = _shape_meta(data_config.shape_meta)
     state_meta = shape_meta["state"]
     action_meta = shape_meta["action"]
     processor = instantiate(data_config.processor)
     action_size = int(data_config.num_frames) - 1
+    sample_stride = int(data_config.get("global_sample_stride", 1))
     source, segments = _catalog_source(
         [str(value) for value in data_config.segment_prefixes],
         catalog_url=data_config.get("rerun_catalog_url"),
         dataset_name=str(data_config.rerun_dataset),
     )
-    sample_index = _full_sample_index(source, _entity("state", state_meta[0]["key"]))
+    first_state_entity = _entity("state", state_meta[0]["key"])
+    sample_index = _full_sample_index(source, first_state_entity)
     starts = sample_index.segment_offsets.astype(np.int64, copy=True)
 
     names: dict[tuple[str, str], str] = {}
-    numeric_fields: dict[str, Field] = {}
-    for kind, metadata in (("state", state_meta), ("action", action_meta)):
-        for meta in metadata:
-            key = meta["key"]
-            name = f"{kind}::{key}"
-            names[(kind, key)] = name
-            numeric_fields[name] = Field(f"/{_entity(kind, key)}:Scalars:scalars", decode=NumericDecoder())
-    numeric = RerunMapDataset(
+    fields: dict[str, Field] = {}
+    for meta in state_meta:
+        key = meta["key"]
+        name = f"state::{key}"
+        names[("state", key)] = name
+        fields[name] = Field(
+            f"/{_entity('state', key)}:Scalars:scalars",
+            window=(0,),
+            decode=NumericDecoder(),
+        )
+    action_offsets = tuple(index * sample_stride for index in range(action_size))
+    for meta in action_meta:
+        key = meta["key"]
+        name = f"action::{key}"
+        names[("action", key)] = name
+        fields[name] = Field(
+            f"/{_entity('action', key)}:Scalars:scalars",
+            window=action_offsets,
+            decode=NumericDecoder(),
+        )
+    numeric = RerunIterableDataset(
         source,
         INDEX,
-        numeric_fields,
+        fields,
+        fetch_block_size=int(data_config.get("stats_fetch_block_size", 4096)),
+        shuffle_strategy=NoShuffle(),
         decode_threads=int(data_config.get("decode_threads", 4)),
+        max_consecutive_skipped_samples=0,
     )
+    # Windowed fields normally trim the final action horizon from every episode. Restore the
+    # state-only index so Rerun resolves those windows by repeating the episode's final row.
     numeric._sample_index = sample_index
-
-    def process_episode(episode: int) -> dict[str, dict[str, torch.Tensor]]:
-        rows = numeric.__getitems__(list(range(int(starts[episode]), int(starts[episode + 1]))))
-        state: dict[str, torch.Tensor] = {}
-        action: dict[str, torch.Tensor] = {}
-        for meta in state_meta:
-            values = torch.stack([cast(torch.Tensor, row[names[("state", meta["key"])]]) for row in rows]).float()
-            state[meta["key"]] = values.unsqueeze(1)
-        for meta in action_meta:
-            values = torch.stack([cast(torch.Tensor, row[names[("action", meta["key"])]]) for row in rows]).float()
-            action[meta["key"]] = _sliding_window(values, action_size)
-        return cast(
-            dict[str, dict[str, torch.Tensor]],
-            processor.action_state_transform({"state": state, "action": action}),
-        )
 
     metrics = ("min", "max", "mean", "var", "q01", "q99")
     collected: dict[str, dict[str, dict[str, list[torch.Tensor]]]] = {
         "state": {meta["key"]: {metric: [] for metric in metrics} for meta in state_meta},
         "action": {meta["key"]: {metric: [] for metric in metrics} for meta in action_meta},
     }
-    with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(process_episode, episode) for episode in range(len(segments))]
-        for future in as_completed(futures):
-            batch = future.result()
-            for kind, metadata in (("state", state_meta), ("action", action_meta)):
-                for meta in metadata:
-                    values = batch[kind][meta["key"]]
-                    buckets = collected[kind][meta["key"]]
-                    buckets["min"].append(values.amin(0))
-                    buckets["max"].append(values.amax(0))
-                    buckets["mean"].append(values.mean(0))
-                    buckets["var"].append(values.var(0))
-                    buckets["q01"].append(torch.quantile(values, 0.01, dim=0))
-                    buckets["q99"].append(torch.quantile(values, 0.99, dim=0))
+
+    def summarize_episode(
+        state_rows: dict[str, list[torch.Tensor]],
+        action_rows: dict[str, list[torch.Tensor]],
+        expected_length: int,
+    ) -> None:
+        actual_length = len(state_rows[state_meta[0]["key"]])
+        if actual_length != expected_length:
+            raise RuntimeError(f"Expected {expected_length} samples in episode, received {actual_length}")
+        batch = cast(
+            dict[str, dict[str, torch.Tensor]],
+            processor.action_state_transform({
+                "state": {key: torch.stack(values).float() for key, values in state_rows.items()},
+                "action": {key: torch.stack(values).float() for key, values in action_rows.items()},
+            }),
+        )
+        for kind, metadata in (("state", state_meta), ("action", action_meta)):
+            for meta in metadata:
+                values = batch[kind][meta["key"]]
+                buckets = collected[kind][meta["key"]]
+                buckets["min"].append(values.amin(0))
+                buckets["max"].append(values.amax(0))
+                buckets["mean"].append(values.mean(0))
+                buckets["var"].append(values.var(0))
+                buckets["q01"].append(torch.quantile(values, 0.01, dim=0))
+                buckets["q99"].append(torch.quantile(values, 0.99, dim=0))
+
+    state_rows: dict[str, list[torch.Tensor]] = {meta["key"]: [] for meta in state_meta}
+    action_rows: dict[str, list[torch.Tensor]] = {meta["key"]: [] for meta in action_meta}
+    episodes_processed = 0
+    samples_processed = 0
+    for samples_processed, sample in enumerate(numeric, start=1):
+        for meta in state_meta:
+            state_rows[meta["key"]].append(cast(torch.Tensor, sample[names[("state", meta["key"])]]))
+        for meta in action_meta:
+            action_rows[meta["key"]].append(cast(torch.Tensor, sample[names[("action", meta["key"])]]))
+
+        if samples_processed == int(starts[episodes_processed + 1]):
+            expected_length = int(starts[episodes_processed + 1] - starts[episodes_processed])
+            summarize_episode(state_rows, action_rows, expected_length)
+            episodes_processed += 1
+            state_rows = {meta["key"]: [] for meta in state_meta}
+            action_rows = {meta["key"]: [] for meta in action_meta}
+
+    if samples_processed != int(starts[-1]) or episodes_processed != len(segments):
+        raise RuntimeError(
+            f"Expected {len(segments)} episodes and {int(starts[-1])} samples, "
+            f"processed {episodes_processed} episodes and {samples_processed} samples"
+        )
 
     def mean_std(means: list[torch.Tensor], variances: list[torch.Tensor]) -> tuple[torch.Tensor, ...]:
         means_tensor, variances_tensor = torch.stack(means), torch.stack(variances)
