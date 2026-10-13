@@ -40,6 +40,9 @@ dependencies = [
   "wandb==0.23.1",
 ]
 
+[project.optional-dependencies]
+rerun = ["rerun-sdk[dataloader,catalog]==0.38.1"]
+
 [tool.setuptools.package-dir]
 "" = "src"
 
